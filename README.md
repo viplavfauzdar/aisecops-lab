@@ -1,5 +1,6 @@
 # AISecOps Lab (Reference Implementation v1)
 
+
 A starter repo to build an **AISecOps** reference system: a deliberately vulnerable AI app that you progressively harden with:
 - tool containment (Tool Gateway + policy engine)
 - secure RAG (pgvector + sanitization hooks)
@@ -7,6 +8,33 @@ A starter repo to build an **AISecOps** reference system: a deliberately vulnera
 - audit logging
 - red-team regression tests
 - CI gates
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    User[User] --> API[/FastAPI API/]
+    API -->|Sanitize Input| Policy[Policy Engine]
+    API -->|LLM Call| LLM["LLM Provider\n(Ollama | OpenAI | Anthropic)"]
+    API -->|Tool Request| Gateway[Tool Gateway]
+    Gateway -->|Validate + Enforce| Policy
+    Gateway --> Tools[Tool Registry]
+    Tools --> External[External Systems]
+
+    API -->|Audit Events| Audit[(Audit Log JSONL)]
+    Gateway -->|Audit Events| Audit
+
+    subgraph "RAG Pipeline (Next Milestone)"
+        Ingest[Ingestion] --> Embed[Embeddings]
+        Embed --> VectorDB[(Postgres + pgvector)]
+        VectorDB --> Retrieve[Retriever]
+        Retrieve --> API
+    end
+
+    CI[GitHub Actions CI] --> Tests[Unit + Security Tests]
+    Tests --> Gateway
+```
+
 
 ## Quickstart (local)
 
