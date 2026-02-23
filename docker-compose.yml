@@ -1,0 +1,27 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aisecops
+      POSTGRES_PASSWORD: aisecops
+      POSTGRES_DB: aisecops
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  api:
+    build: ./apps/api
+    env_file:
+      - .env
+    volumes:
+      - ./apps/api:/app
+      - ./config:/app/config
+      - ./audit:/app/audit
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  db_data:

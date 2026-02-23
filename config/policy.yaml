@@ -1,0 +1,17 @@
+# AISecOps policy (starter)
+user_sanitize_regex:
+  # redact obvious secrets in user input (starter only; you will improve)
+  - "(?i)api[_-]?key\s*[:=]\s*\S+"
+  - "(?i)bearer\s+\S+"
+
+tools:
+  - name: echo
+    allow: true
+    allowed_params: ["text", "anything"]
+
+  - name: http_get
+    allow: true
+    allowed_params: ["url"]
+    deny_patterns:
+      # starter SSRF guard: deny localhost + metadata IPs (expand later)
+      url: "^(https?://)?(localhost|127\.0\.0\.1|0\.0\.0\.0|169\.254\.169\.254)([:/]|$)"
