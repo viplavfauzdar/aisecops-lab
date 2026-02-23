@@ -21,4 +21,14 @@ class Settings(BaseSettings):
     AUDIT_LOG_PATH: str = "/app/audit/audit.jsonl"
     POLICY_PATH: str = "/app/config/policy.yaml"
 
+    # AISecOps Mode
+    # insecure = baseline (no enforcement)
+    # secure   = enforce policy controls
+    AISECOPS_MODE: str = "insecure"
+
+    # Tool Gateway Enforcement
+    # False = bypass policy validation
+    # True  = enforce allowlist + param validation + deny rules
+    TOOL_GATEWAY_ENFORCE: bool = False
+
     DATABASE_URL: str = "postgresql+psycopg://aisecops:aisecops@db:5432/aisecops"
