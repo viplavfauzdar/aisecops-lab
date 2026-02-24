@@ -16,6 +16,10 @@ class PolicyEngine:
         self.cfg = cfg or {}
         self.user_sanitize_patterns = [re.compile(p, re.IGNORECASE) for p in self.cfg.get("user_sanitize_regex", [])]
         self.tool_rules = self._load_tool_rules(self.cfg.get("tools", []))
+        # RAG policy (Secure RAG controls)
+        self._rag_cfg = self.cfg.get("rag", {}) or {}
+        # Output policy (LLM response validation controls)
+        self._output_cfg = self.cfg.get("output", {}) or {}
 
     @staticmethod
     def from_file(path: str) -> "PolicyEngine":
@@ -62,3 +66,35 @@ class PolicyEngine:
                     if re.search(regex, params[k], flags=re.IGNORECASE):
                         errs.append(f"Param '{k}' matched deny pattern")
         return errs
+
+    # ---- RAG policy helpers ----
+    def rag_cfg(self) -> Dict[str, Any]:
+        """Return the raw RAG policy config dict (may be empty)."""
+        return self._rag_cfg or {}
+
+    def rag_sanitize_retrieval_enabled(self) -> bool:
+        """Whether retrieval sanitization is enabled for Secure RAG."""
+        return bool((self._rag_cfg or {}).get("sanitize_retrieval", False))
+
+    def rag_deny_patterns(self) -> List[str]:
+        """Regex patterns used to drop/neutralize instruction-like retrieved content."""
+        pats = (self._rag_cfg or {}).get("deny_patterns", [])
+        if not isinstance(pats, list):
+            return []
+        return [str(p) for p in pats if str(p).strip()]
+
+    # ---- Output policy helpers ----
+    def output_cfg(self) -> Dict[str, Any]:
+        """Return the raw output policy config dict (may be empty)."""
+        return self._output_cfg or {}
+
+    def output_require_citations(self) -> bool:
+        """Whether model replies must include at least one [S#] citation."""
+        return bool((self._output_cfg or {}).get("require_citations", False))
+
+    def output_forbidden_substrings(self) -> List[str]:
+        """Substrings that should cause the model output to be blocked/refused."""
+        subs = (self._output_cfg or {}).get("forbidden_substrings", [])
+        if not isinstance(subs, list):
+            return []
+        return [str(s) for s in subs if str(s).strip()]

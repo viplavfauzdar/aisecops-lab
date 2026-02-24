@@ -15,3 +15,30 @@ tools:
     deny_patterns:
       # starter SSRF guard: deny localhost + metadata IPs (expand later)
       url: '^(https?://)?(localhost|127\.0\.0\.1|0\.0\.0\.0|169\.254\.169\.254)([:/]|$)'
+
+rag:
+  sanitize_retrieval: true
+  deny_patterns:
+    - "\\b(ignore|disregard|override)\\b.*\\b(instruction|previous|system|developer)\\b"
+    - "\\b(system prompt|developer message|hidden prompt)\\b"
+    - "\\b(call|invoke|execute|run)\\b\\s+\\w+\\b"
+    - "\\bhttps?://\\S+"
+    - "\\b(curl|wget|powershell|bash|sh)\\b"
+    - "\\b(exfiltrate|leak|steal)\\b"
+
+output:
+  require_citations: true
+  # If any of these substrings appear in the model reply, block/refuse.
+  forbidden_substrings:
+    - "169.254.169.254"
+    - "localhost"
+    - "127.0.0.1"
+    - "http_get"
+    - "curl "
+    - "wget "
+    - "powershell"
+    - "bash "
+    - "system prompt"
+    - "developer message"
+    - "ignore previous"
+    - "override instructions"
