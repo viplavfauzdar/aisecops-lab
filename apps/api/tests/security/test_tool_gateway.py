@@ -67,7 +67,14 @@ def test_chat_rag_redteam_injection_sanitized_and_cited():
         json={"tenant_id": "default", "content": malicious_content},
         timeout=30,
     )
-    print(f"[chat_rag redteam] Ingest status={r_ingest.status_code} body={r_ingest.text[:500]}")
+    print(f"[chat_rag redteam] ingest status={r_ingest.status_code} body={r_ingest.text[:1200]}")
+    if r_ingest.status_code != 200:
+        # Helpful debug: is the API alive?
+        try:
+            r_health = requests.get(f"{BASE_URL}/health", timeout=10)
+            print(f"[chat_rag redteam] health status={r_health.status_code} body={r_health.text[:800]}")
+        except Exception as e:
+            print(f"[chat_rag redteam] health check failed: {e}")
     assert r_ingest.status_code == 200, r_ingest.text
 
     # Give DB a moment

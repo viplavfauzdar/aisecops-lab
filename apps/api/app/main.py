@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 import os
 import re
+import traceback
 
 app = FastAPI(title="AISecOps Lab API", version="0.1.0")
 
@@ -32,6 +33,8 @@ async def _request_id_middleware(request: Request, call_next):
 
 settings = Settings()
 engine: Engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+# AuditLogger must be initialized before schema bootstrap so errors can be logged.
+audit = AuditLogger(settings.AUDIT_LOG_PATH)
 
 def _ensure_pgvector_schema() -> None:
     """
@@ -79,12 +82,28 @@ def _ensure_pgvector_schema() -> None:
 
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id);"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(document_id);"))
+            # Emit a success marker so we can tell bootstrap ran.
+            try:
+                audit.event("schema_bootstrap_ok", {"embed_dim": embed_dim}, severity="info")
+            except Exception:
+                pass
+            print(f"[schema_bootstrap_ok] embed_dim={embed_dim}")
     except Exception as e:
         # Best-effort: if DB isn't reachable, app can still start and surface errors per-endpoint.
+        # But DO emit useful diagnostics to logs/audit.
+        err = {"error": str(e), "error_type": type(e).__name__}
         try:
-            audit.event("schema_bootstrap_error", {"error": str(e)}, severity="warn")
+            err["traceback"] = traceback.format_exc()
         except Exception:
             pass
+
+        try:
+            audit.event("schema_bootstrap_error", err, severity="warn")
+        except Exception:
+            pass
+
+        # Also print to container logs for fast debugging.
+        print("[schema_bootstrap_error]", err)
         return
 
 
@@ -93,7 +112,6 @@ def _startup_schema_bootstrap() -> None:
     _ensure_pgvector_schema()
 
 policy = PolicyEngine.from_file(settings.POLICY_PATH)
-audit = AuditLogger(settings.AUDIT_LOG_PATH)
 llm = get_llm_client(settings)
 
 gateway = ToolGateway(policy=policy, audit=audit, enforce=settings.TOOL_GATEWAY_ENFORCE)
@@ -433,8 +451,14 @@ async def rag_ingest(req: RAGIngestRequest):
                     },
                 )
     except Exception as e:
-        audit.event("rag_ingest_error", {"error": str(e)}, severity="error")
-        raise HTTPException(status_code=500, detail="RAG ingest failed")
+        # Log the full error so CI/local runs can diagnose why ingest failed (schema, auth, vector dim, etc).
+        audit.event(
+            "rag_ingest_error",
+            {"error": str(e), "error_type": type(e).__name__},
+            severity="error",
+        )
+        # In dev/CI, return a more informative error message to speed up debugging.
+        raise HTTPException(status_code=500, detail=f"RAG ingest failed: {type(e).__name__}: {e}")
 
     audit.event("rag_ingest", {"tenant_id": tenant_id, "doc_id": int(doc_id), "chunks": len(chunks)})
     return {"ok": True, "tenant_id": tenant_id, "document_id": int(doc_id), "chunks": len(chunks)}
@@ -462,8 +486,12 @@ async def rag_query(req: RAGQueryRequest):
                 {"tenant_id": tenant_id, "q_emb": q_emb_lit, "top_k": top_k},
             ).mappings().all()
     except Exception as e:
-        audit.event("rag_query_error", {"error": str(e)}, severity="error")
-        raise HTTPException(status_code=500, detail="RAG query failed")
+        audit.event(
+            "rag_query_error",
+            {"error": str(e), "error_type": type(e).__name__},
+            severity="error",
+        )
+        raise HTTPException(status_code=500, detail=f"RAG query failed: {type(e).__name__}: {e}")
 
     results = []
     sanitized_count = 0
