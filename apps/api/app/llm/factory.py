@@ -6,7 +6,11 @@ from app.llm.anthropic_client import AnthropicClient
 def get_llm_client(settings: Settings):
     provider = (settings.LLM_PROVIDER or "ollama").lower()
     if provider == "ollama":
-        return OllamaClient(settings.OLLAMA_BASE_URL, settings.OLLAMA_CHAT_MODEL)
+        return OllamaClient(
+            settings.OLLAMA_BASE_URL,
+            settings.OLLAMA_CHAT_MODEL,
+            settings.OLLAMA_TIMEOUT_SECONDS,
+        )
     if provider == "openai":
         return OpenAIClient(settings.OPENAI_API_KEY, settings.OPENAI_MODEL)
     if provider == "anthropic":

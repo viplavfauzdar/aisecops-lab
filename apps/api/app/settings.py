@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://host.docker.internal:11434"
     OLLAMA_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text:latest"
+    OLLAMA_TIMEOUT_SECONDS: int = 180
 
     # OpenAI
     OPENAI_API_KEY: str = ""
