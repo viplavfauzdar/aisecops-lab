@@ -29,7 +29,7 @@ jobs:
         working-directory: apps/api
         run: |
           # GitHub runners don't have a local LLM. The /chat_rag red-team test is an integration test.
-          pytest -q tests/security -k "not chat_rag"
+          pytest -q tests/security -k "not chat_rag" --ignore=tests/security/test_secure_rag.py
 
   integration_docker:
     name: Integration tests (docker compose)
