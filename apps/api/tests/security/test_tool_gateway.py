@@ -47,6 +47,8 @@ async def test_ssrf_block():
         assert res["ok"] is False
 
 
+@pytest.mark.integration
+@pytest.mark.llm
 def test_chat_rag_redteam_injection_sanitized_and_cited():
     """Red-team: poisoned retrieval must be sanitized, and answer must include citations."""
 

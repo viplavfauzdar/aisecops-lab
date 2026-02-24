@@ -25,17 +25,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run security unit tests (exclude /chat_rag integration)
+      - name: Run security unit tests (no integration)
         working-directory: apps/api
         run: |
-          # GitHub runners don't have a local LLM. The /chat_rag red-team test is an integration test.
-          pytest -q tests/security -k "not chat_rag" --ignore=tests/security/test_secure_rag.py
+          pytest -q tests/security -m "not integration"
 
   integration_docker:
     name: Integration tests (docker compose)
     runs-on: self-hosted
     # Run manually (intended for self-hosted runners where Ollama is available).
-    if: ${{ github.event_name == 'workflow_dispatch' }}
 
     steps:
       - name: Checkout
@@ -49,20 +47,20 @@ jobs:
       - name: Create .env (CI)
         run: |
           cat > .env << EOF
-            AISECOPS_MODE=secure
-            LLM_PROVIDER=ollama
-            # For self-hosted runners: Ollama should be running on the host.
-            # On macOS/Windows Docker Desktop, host.docker.internal works.
-            # On Linux, you may need to set this to the host gateway IP.
-            OLLAMA_BASE_URL=http://host.docker.internal:11434
-            POLICY_PATH=/app/config/policy.yaml
-            AUDIT_PATH=/app/audit/audit.jsonl
-            PGHOST=pgvector
-            PGPORT=5432
-            PGDATABASE=aisecops
-            PGUSER=postgres
-            PGPASSWORD=postgres
-            EOF
+AISECOPS_MODE=secure
+LLM_PROVIDER=ollama
+# For self-hosted runners: Ollama should be running on the host.
+# On macOS/Windows Docker Desktop, host.docker.internal works.
+# On Linux, you may need to set this to the host gateway IP.
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+POLICY_PATH=/app/config/policy.yaml
+AUDIT_PATH=/app/audit/audit.jsonl
+PGHOST=pgvector
+PGPORT=5432
+PGDATABASE=aisecops
+PGUSER=postgres
+PGPASSWORD=postgres
+EOF
 
       - name: Build and start stack
         run: |
@@ -85,7 +83,7 @@ jobs:
 
       - name: Run security tests (including /chat_rag)
         run: |
-          docker compose exec -T api pytest -q
+          docker compose exec -T api pytest -q -m "integration"
 
       - name: Dump logs on failure
         if: failure()
