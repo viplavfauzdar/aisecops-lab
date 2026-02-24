@@ -70,6 +70,7 @@ jobs:
           PGDATABASE=aisecops
           PGUSER=aisecops
           PGPASSWORD=aisecops
+          DATABASE_URL=postgresql://aisecops:aisecops@db:5432/aisecops
           EOF
 
       - name: Build and start stack
@@ -98,7 +99,7 @@ jobs:
 
       - name: Run security tests (including /chat_rag)
         run: |
-          docker compose exec -T api pytest -q -m "integration"
+          docker compose exec -T api pytest -q -m "integration" -W ignore::pytest.PytestUnknownMarkWarning
 
       - name: Dump logs on failure
         if: failure()
