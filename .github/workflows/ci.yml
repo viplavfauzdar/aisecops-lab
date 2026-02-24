@@ -1,24 +1,100 @@
-name: ci
+name: CI
 
 on:
-  push:
-  pull_request:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
 
 jobs:
-  test:
+  unit_security:
+    name: Unit + Security tests (no live LLM)
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install deps
+
+      - name: Install dependencies
         working-directory: apps/api
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio
-      - name: Run tests
+
+      - name: Run security unit tests (exclude /chat_rag integration)
         working-directory: apps/api
         run: |
-          pytest -q ../../tests/security
+          # GitHub runners don't have a local LLM. The /chat_rag red-team test is an integration test.
+          pytest -q tests/security -k "not chat_rag"
+
+  integration_docker:
+    name: Integration tests (docker compose)
+    runs-on: self-hosted
+    # Run manually (intended for self-hosted runners where Ollama is available).
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Docker versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Create .env (CI)
+        run: |
+          cat > .env << EOF
+            AISECOPS_MODE=secure
+            LLM_PROVIDER=ollama
+            # For self-hosted runners: Ollama should be running on the host.
+            # On macOS/Windows Docker Desktop, host.docker.internal works.
+            # On Linux, you may need to set this to the host gateway IP.
+            OLLAMA_BASE_URL=http://host.docker.internal:11434
+            POLICY_PATH=/app/config/policy.yaml
+            AUDIT_PATH=/app/audit/audit.jsonl
+            PGHOST=pgvector
+            PGPORT=5432
+            PGDATABASE=aisecops
+            PGUSER=postgres
+            PGPASSWORD=postgres
+            EOF
+
+      - name: Build and start stack
+        run: |
+          docker compose up --build -d
+          docker compose ps
+
+      - name: Wait for API health
+        run: |
+          for i in {1..60}; do
+            if docker compose exec -T api curl -sf http://localhost:8000/health > /dev/null; then
+              echo "API is healthy"
+              exit 0
+            fi
+            echo "Waiting for API..."
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          docker compose logs api
+          exit 1
+
+      - name: Run security tests (including /chat_rag)
+        run: |
+          docker compose exec -T api pytest -q
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs api || true
+          docker compose logs pgvector || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose down -v
