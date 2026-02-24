@@ -5,6 +5,11 @@ services:
       POSTGRES_USER: aisecops
       POSTGRES_PASSWORD: aisecops
       POSTGRES_DB: aisecops
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aisecops -d aisecops"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     ports:
       - "5432:5432"
     volumes:
@@ -21,7 +26,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
 volumes:
   db_data:

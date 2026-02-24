@@ -11,6 +11,7 @@ from sqlalchemy.engine import Engine
 import os
 import re
 import traceback
+from threading import Lock
 
 app = FastAPI(title="AISecOps Lab API", version="0.1.0")
 
@@ -35,8 +36,10 @@ settings = Settings()
 engine: Engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
 # AuditLogger must be initialized before schema bootstrap so errors can be logged.
 audit = AuditLogger(settings.AUDIT_LOG_PATH)
+_schema_bootstrap_lock = Lock()
+_schema_bootstrap_ok = False
 
-def _ensure_pgvector_schema() -> None:
+def _ensure_pgvector_schema() -> bool:
     """
     Idempotent schema bootstrap for local/dev + CI.
     Ensures the RAG tables exist so /rag/ingest doesn't 500 on a fresh database.
@@ -47,64 +50,75 @@ def _ensure_pgvector_schema() -> None:
     except Exception:
         embed_dim = 1536
 
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+    global _schema_bootstrap_ok
+    if _schema_bootstrap_ok:
+        return True
 
-            conn.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS documents (
-                      id BIGSERIAL PRIMARY KEY,
-                      tenant_id TEXT NOT NULL,
-                      content TEXT NOT NULL,
-                      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                    """
+    with _schema_bootstrap_lock:
+        if _schema_bootstrap_ok:
+            return True
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS documents (
+                          id BIGSERIAL PRIMARY KEY,
+                          tenant_id TEXT NOT NULL,
+                          content TEXT NOT NULL,
+                          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
                 )
-            )
 
-            # NOTE: embedding dimension is fixed at table creation time.
-            conn.execute(
-                text(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS chunks (
-                      id BIGSERIAL PRIMARY KEY,
-                      document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                      tenant_id TEXT NOT NULL,
-                      content TEXT NOT NULL,
-                      embedding vector({embed_dim}),
-                      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                    """
+                # NOTE: embedding dimension is fixed at table creation time.
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS chunks (
+                          id BIGSERIAL PRIMARY KEY,
+                          document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                          tenant_id TEXT NOT NULL,
+                          content TEXT NOT NULL,
+                          embedding vector({embed_dim}),
+                          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                        """
+                    )
                 )
-            )
 
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id);"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(document_id);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(document_id);"))
+
             # Emit a success marker so we can tell bootstrap ran.
             try:
                 audit.event("schema_bootstrap_ok", {"embed_dim": embed_dim}, severity="info")
             except Exception:
                 pass
+            _schema_bootstrap_ok = True
             print(f"[schema_bootstrap_ok] embed_dim={embed_dim}")
-    except Exception as e:
-        # Best-effort: if DB isn't reachable, app can still start and surface errors per-endpoint.
-        # But DO emit useful diagnostics to logs/audit.
-        err = {"error": str(e), "error_type": type(e).__name__}
-        try:
-            err["traceback"] = traceback.format_exc()
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            # Best-effort: if DB isn't reachable, app can still start and surface errors per-endpoint.
+            # But DO emit useful diagnostics to logs/audit.
+            err = {"error": str(e), "error_type": type(e).__name__}
+            try:
+                err["traceback"] = traceback.format_exc()
+            except Exception:
+                pass
 
-        try:
-            audit.event("schema_bootstrap_error", err, severity="warn")
-        except Exception:
-            pass
+            try:
+                audit.event("schema_bootstrap_error", err, severity="warn")
+            except Exception:
+                pass
 
-        # Also print to container logs for fast debugging.
-        print("[schema_bootstrap_error]", err)
-        return
+            # Also print to container logs for fast debugging.
+            print("[schema_bootstrap_error]", err)
+            return False
 
 
 @app.on_event("startup")
@@ -352,6 +366,9 @@ async def chat(req: ChatRequest):
 @app.post("/chat_rag")
 async def chat_rag(req: ChatRAGRequest):
     """Chat with retrieval + context contract + citations."""
+    if not _ensure_pgvector_schema():
+        raise HTTPException(status_code=503, detail="Database schema not ready")
+
     tenant_id = req.tenant_id or "default"
     user_msg = req.message
     top_k = req.top_k
@@ -421,6 +438,9 @@ async def chat_rag(req: ChatRAGRequest):
 
 @app.post("/rag/ingest")
 async def rag_ingest(req: RAGIngestRequest):
+    if not _ensure_pgvector_schema():
+        raise HTTPException(status_code=503, detail="Database schema not ready")
+
     tenant_id = req.tenant_id or "default"
     content = req.content
     # RAG v0: no sanitization yet. (We will harden later.)
@@ -466,6 +486,9 @@ async def rag_ingest(req: RAGIngestRequest):
 
 @app.post("/rag/query")
 async def rag_query(req: RAGQueryRequest):
+    if not _ensure_pgvector_schema():
+        raise HTTPException(status_code=503, detail="Database schema not ready")
+
     tenant_id = req.tenant_id or "default"
     query = req.query
     top_k = req.top_k
