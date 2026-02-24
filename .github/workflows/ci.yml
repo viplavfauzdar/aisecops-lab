@@ -47,20 +47,20 @@ jobs:
       - name: Create .env (CI)
         run: |
           cat > .env << EOF
-AISECOPS_MODE=secure
-LLM_PROVIDER=ollama
-# For self-hosted runners: Ollama should be running on the host.
-# On macOS/Windows Docker Desktop, host.docker.internal works.
-# On Linux, you may need to set this to the host gateway IP.
-OLLAMA_BASE_URL=http://host.docker.internal:11434
-POLICY_PATH=/app/config/policy.yaml
-AUDIT_PATH=/app/audit/audit.jsonl
-PGHOST=pgvector
-PGPORT=5432
-PGDATABASE=aisecops
-PGUSER=postgres
-PGPASSWORD=postgres
-EOF
+          AISECOPS_MODE=secure
+          LLM_PROVIDER=ollama
+          # For self-hosted runners: Ollama should be running on the host.
+          # On macOS/Windows Docker Desktop, host.docker.internal works.
+          # On Linux, you may need to set this to the host gateway IP.
+          OLLAMA_BASE_URL=http://host.docker.internal:11434
+          POLICY_PATH=/app/config/policy.yaml
+          AUDIT_PATH=/app/audit/audit.jsonl
+          PGHOST=pgvector
+          PGPORT=5432
+          PGDATABASE=aisecops
+          PGUSER=postgres
+          PGPASSWORD=postgres
+          EOF
 
       - name: Build and start stack
         run: |
