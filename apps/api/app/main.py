@@ -8,6 +8,7 @@ from app.tools.gateway import ToolGateway, ToolRequest
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+import os
 import re
 
 app = FastAPI(title="AISecOps Lab API", version="0.1.0")
@@ -31,6 +32,66 @@ async def _request_id_middleware(request: Request, call_next):
 
 settings = Settings()
 engine: Engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+
+def _ensure_pgvector_schema() -> None:
+    """
+    Idempotent schema bootstrap for local/dev + CI.
+    Ensures the RAG tables exist so /rag/ingest doesn't 500 on a fresh database.
+    """
+    embed_dim_raw = os.getenv("EMBED_DIM", "1536")
+    try:
+        embed_dim = int(embed_dim_raw)
+    except Exception:
+        embed_dim = 1536
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS documents (
+                      id BIGSERIAL PRIMARY KEY,
+                      tenant_id TEXT NOT NULL,
+                      content TEXT NOT NULL,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+            )
+
+            # NOTE: embedding dimension is fixed at table creation time.
+            conn.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS chunks (
+                      id BIGSERIAL PRIMARY KEY,
+                      document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                      tenant_id TEXT NOT NULL,
+                      content TEXT NOT NULL,
+                      embedding vector({embed_dim}),
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+            )
+
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id);"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(document_id);"))
+    except Exception as e:
+        # Best-effort: if DB isn't reachable, app can still start and surface errors per-endpoint.
+        try:
+            audit.event("schema_bootstrap_error", {"error": str(e)}, severity="warn")
+        except Exception:
+            pass
+        return
+
+
+@app.on_event("startup")
+def _startup_schema_bootstrap() -> None:
+    _ensure_pgvector_schema()
+
 policy = PolicyEngine.from_file(settings.POLICY_PATH)
 audit = AuditLogger(settings.AUDIT_LOG_PATH)
 llm = get_llm_client(settings)
