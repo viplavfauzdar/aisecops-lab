@@ -49,21 +49,32 @@ jobs:
           cat > .env << EOF
           AISECOPS_MODE=secure
           LLM_PROVIDER=ollama
+
           # For self-hosted runners: Ollama should be running on the host.
           # On macOS/Windows Docker Desktop, host.docker.internal works.
           # On Linux, you may need to set this to the host gateway IP.
           OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+          # Models
+          OLLAMA_EMBED_MODEL=nomic-embed-text:latest
+          OLLAMA_CHAT_MODEL=qwen3:8b
+          EMBED_DIM=768
+
+          # Paths inside the API container (these are mounted in docker-compose.yml)
           POLICY_PATH=/app/config/policy.yaml
           AUDIT_PATH=/app/audit/audit.jsonl
-          PGHOST=pgvector
+
+          # Postgres service name in docker-compose.yml is "db"
+          PGHOST=db
           PGPORT=5432
           PGDATABASE=aisecops
-          PGUSER=postgres
-          PGPASSWORD=postgres
+          PGUSER=aisecops
+          PGPASSWORD=aisecops
           EOF
 
       - name: Build and start stack
         run: |
+          docker compose down -v --remove-orphans || true
           docker compose up --build -d
           docker compose ps
 
@@ -81,6 +92,10 @@ jobs:
           docker compose logs api
           exit 1
 
+      - name: Show API config snapshot (debug)
+        run: |
+          docker compose exec -T api sh -lc 'python -c "import os; keys=[\"AISECOPS_MODE\",\"LLM_PROVIDER\",\"OLLAMA_BASE_URL\",\"OLLAMA_EMBED_MODEL\",\"OLLAMA_CHAT_MODEL\",\"EMBED_DIM\",\"PGHOST\",\"PGDATABASE\",\"PGUSER\",\"POLICY_PATH\",\"AUDIT_PATH\"]; print({k:os.getenv(k) for k in keys})"'
+
       - name: Run security tests (including /chat_rag)
         run: |
           docker compose exec -T api pytest -q -m "integration"
@@ -90,7 +105,7 @@ jobs:
         run: |
           docker compose ps
           docker compose logs api || true
-          docker compose logs pgvector || true
+          docker compose logs db || true
 
       - name: Teardown
         if: always()
