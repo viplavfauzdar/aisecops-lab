@@ -11,3 +11,4 @@ sqlalchemy==2.0.36
 pytest
 requests
 pytest-asyncio
+prometheus-client==0.20.0

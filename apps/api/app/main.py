@@ -12,8 +12,273 @@ import os
 import re
 import traceback
 from threading import Lock
+# --- Additional imports for /security/metrics ---
+import json
+import time
+from collections import Counter, deque
+from datetime import datetime, timezone
+
+# --- Prometheus client imports ---
+from prometheus_client import Counter as PromCounter, Histogram as PromHistogram, generate_latest, CONTENT_TYPE_LATEST
+
+
 
 app = FastAPI(title="AISecOps Lab API", version="0.1.0")
+
+# --- Prometheus Metrics (AISecOps Telemetry) ---
+HTTP_REQUESTS_TOTAL = PromCounter(
+    "aisecops_http_requests_total",
+    "Total HTTP requests handled by the API",
+    ["path", "method", "status"],
+)
+
+HTTP_REQUEST_LATENCY_SECONDS = PromHistogram(
+    "aisecops_http_request_latency_seconds",
+    "HTTP request latency in seconds",
+    ["path", "method"],
+)
+
+RETRIEVAL_POISONING_TOTAL = PromCounter(
+    "aisecops_retrieval_poisoning_detected_total",
+    "Total retrieval poisoning detections (indirect prompt injection signals)",
+    ["tenant_id"],
+)
+
+OUTPUT_BLOCK_TOTAL = PromCounter(
+    "aisecops_output_block_total",
+    "Total model output blocks by policy/validator",
+    ["tenant_id", "reason"],
+)
+
+TOOL_BLOCK_TOTAL = PromCounter(
+    "aisecops_tool_block_total",
+    "Total tool execution blocks by policy/tool gateway",
+    ["tenant_id"],
+)
+
+LLM_ERRORS_TOTAL = PromCounter(
+    "aisecops_llm_errors_total",
+    "Total LLM call errors",
+    ["provider", "where"],
+)
+
+RAG_INGEST_TOTAL = PromCounter(
+    "aisecops_rag_ingest_total",
+    "Total successful RAG ingests",
+    ["tenant_id"],
+)
+
+RAG_QUERY_TOTAL = PromCounter(
+    "aisecops_rag_query_total",
+    "Total successful RAG queries",
+    ["tenant_id"],
+)
+
+TOOL_EXECUTE_TOTAL = PromCounter(
+    "aisecops_tool_execute_total",
+    "Total tool execute requests",
+    ["tenant_id"],
+)
+
+
+# --- Security Metrics Helpers ---
+def _audit_path() -> str:
+    """
+    Resolve audit.jsonl path for metrics. Prefer explicit env (docker-compose sets AUDIT_PATH).
+    """
+    return os.getenv("AUDIT_PATH") or os.getenv("AUDIT_LOG_PATH") or "/app/audit/audit.jsonl"
+
+
+def _compute_audit_metrics(window_seconds: int | None = 86400, max_lines: int = 50000) -> dict:
+    """
+    Compute lightweight telemetry from audit.jsonl for dashboards.
+    - window_seconds: only include events with ts >= now - window_seconds. If None, include all (tail-capped).
+    - max_lines: cap how many recent lines to scan to keep endpoint fast.
+    """
+    path = _audit_path()
+    now = time.time()
+    cutoff = (now - window_seconds) if window_seconds else None
+
+    by_event: Counter[str] = Counter()
+    by_severity: Counter[str] = Counter()
+    last_ts: float | None = None
+
+    try:
+        dq: deque[str] = deque(maxlen=max_lines)
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line:
+                    dq.append(line)
+
+        for line in dq:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            ts = rec.get("ts")
+            if isinstance(ts, (int, float)):
+                ts_f = float(ts)
+                if last_ts is None or ts_f > last_ts:
+                    last_ts = ts_f
+                if cutoff is not None and ts_f < cutoff:
+                    continue
+            elif cutoff is not None:
+                # If windowed metrics are requested, skip entries without a numeric ts.
+                continue
+
+            ev = rec.get("event") or "unknown"
+            sev = rec.get("severity") or "unknown"
+            by_event[str(ev)] += 1
+            by_severity[str(sev)] += 1
+
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "audit_file_not_found",
+            "audit_path": path,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "audit_read_failed",
+            "audit_path": path,
+            "detail": f"{type(e).__name__}: {e}",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return {
+        "ok": True,
+        "audit_path": path,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "window_seconds": window_seconds,
+        "scanned_max_lines": max_lines,
+        "last_event_ts": last_ts,
+        "counts_by_event": dict(by_event),
+        "counts_by_severity": dict(by_severity),
+        "total_events_counted": int(sum(by_event.values())),
+    }
+
+
+# --- Audit Event Reading Helper ---
+def _read_recent_audit_events(
+    *,
+    limit: int = 200,
+    event: str | None = None,
+    severity: str | None = None,
+    request_id: str | None = None,
+    tenant_id: str | None = None,
+    window_seconds: int | None = 86400,
+    max_lines: int = 50000,
+) -> dict:
+    """
+    Read recent audit events from audit.jsonl (tail-capped) with simple filtering.
+    Returns {"ok": bool, "events": [...], ...} with newest-first ordering.
+    """
+    # Guardrails
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 200
+    if limit < 1:
+        limit = 1
+    if limit > 2000:
+        limit = 2000
+
+    path = _audit_path()
+    now = time.time()
+    cutoff = (now - window_seconds) if (window_seconds is not None and window_seconds > 0) else None
+
+    want_event = (event or "").strip() or None
+    want_sev = (severity or "").strip() or None
+    want_rid = (request_id or "").strip() or None
+    want_tenant = (tenant_id or "").strip() or None
+
+    try:
+        dq: deque[str] = deque(maxlen=max_lines)
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line:
+                    dq.append(line)
+
+        out: list[dict] = []
+        # Iterate newest-first
+        for line in reversed(dq):
+            if len(out) >= limit:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            ts = rec.get("ts")
+            if cutoff is not None:
+                if not isinstance(ts, (int, float)):
+                    continue
+                if float(ts) < cutoff:
+                    continue
+
+            if want_event and str(rec.get("event") or "") != want_event:
+                continue
+            if want_sev and str(rec.get("severity") or "") != want_sev:
+                continue
+            if want_rid and str(rec.get("request_id") or "") != want_rid:
+                continue
+
+            # tenant_id may be promoted (new format) or inside payload (older format)
+            rec_tenant = rec.get("tenant_id")
+            if rec_tenant is None:
+                payload = rec.get("payload")
+                if isinstance(payload, dict):
+                    rec_tenant = payload.get("tenant_id") or payload.get("tenant")
+            if want_tenant and str(rec_tenant or "") != want_tenant:
+                continue
+
+            # Always include a resolved tenant_id field for convenience
+            if rec.get("tenant_id") is None and rec_tenant is not None:
+                rec["tenant_id"] = rec_tenant
+
+            out.append(rec)
+
+        return {
+            "ok": True,
+            "audit_path": path,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "window_seconds": window_seconds,
+            "limit": limit,
+            "filters": {
+                "event": want_event,
+                "severity": want_sev,
+                "request_id": want_rid,
+                "tenant_id": want_tenant,
+            },
+            "events": out,
+        }
+
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "audit_file_not_found",
+            "audit_path": path,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "events": [],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "audit_read_failed",
+            "audit_path": path,
+            "detail": f"{type(e).__name__}: {e}",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "events": [],
+        }
 
 
 # --- Request ID Correlation Middleware ---
@@ -22,15 +287,31 @@ async def _request_id_middleware(request: Request, call_next):
     # Prefer an incoming request id if provided; otherwise generate one.
     rid = request.headers.get("x-request-id") or new_request_id()
     set_request_id(rid)
+    _t0 = time.time()
+
+    status_code = 500
+    path = request.url.path
+    method = request.method
 
     try:
         response: Response = await call_next(request)
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        response.headers["X-Request-Id"] = rid
+        return response
     finally:
+        try:
+            # Record Prometheus metrics (never fail request).
+            dt = max(0.0, time.time() - _t0)
+            HTTP_REQUESTS_TOTAL.labels(path=path, method=method, status=str(status_code)).inc()
+            HTTP_REQUEST_LATENCY_SECONDS.labels(path=path, method=method).observe(dt)
+        except Exception:
+            pass
+
         # Best-effort reset: clear request id after the request finishes.
         set_request_id(None)
 
-    response.headers["X-Request-Id"] = rid
-    return response
+    # If we reached here, response is already returned from the try-block above.
+    # This line is kept for clarity; header setting is done below.
 
 settings = Settings()
 engine: Engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
@@ -129,6 +410,16 @@ policy = PolicyEngine.from_file(settings.POLICY_PATH)
 llm = get_llm_client(settings)
 
 gateway = ToolGateway(policy=policy, audit=audit, enforce=settings.TOOL_GATEWAY_ENFORCE)
+
+
+# --- Replay Request Model ---
+class ReplayRequest(BaseModel):
+    request_id: str = Field(..., min_length=8)
+    # Replay needs the original user message unless you choose to store it in audit logs.
+    message: str | None = None
+    # Optional overrides (if not provided, inferred from audit when possible)
+    tenant_id: str | None = None
+    top_k: int | None = Field(default=None, ge=1, le=20)
 
 class ChatRequest(BaseModel):
     message: str
@@ -279,6 +570,43 @@ def _sanitize_retrieved_text(text_in: str) -> tuple[str, bool]:
         changed = True
     return out, changed
 
+
+# --- Poisoning Detection Helper ---
+def _poison_matches(text_in: str) -> list[str]:
+    """
+    Best-effort detection signal for retrieval poisoning attempts.
+    Returns a list of matched substrings/pattern hits (may be empty).
+    """
+    if not text_in:
+        return []
+    deny_re = _get_retrieval_deny_re()
+    if deny_re is None:
+        return []
+    hits: list[str] = []
+    try:
+        # Scan per-line to keep matches readable.
+        for line in (text_in or "").splitlines():
+            if not line.strip():
+                continue
+            if deny_re.search(line):
+                # Try to capture the exact matching substring if possible.
+                m = deny_re.search(line)
+                if m:
+                    # m.group(0) is the full match; truncate to avoid huge logs.
+                    hits.append((m.group(0) or "").strip()[:120])
+                else:
+                    hits.append("match")
+        # Deduplicate while preserving order.
+        seen = set()
+        out: list[str] = []
+        for h in hits:
+            if h and h not in seen:
+                seen.add(h)
+                out.append(h)
+        return out
+    except Exception:
+        return []
+
 # --- Context Contract (Secure RAG) ---
 def _format_sources_for_prompt(results: list[dict]) -> str:
     """Format retrieved chunks as untrusted sources with stable citation IDs."""
@@ -347,6 +675,158 @@ def _validate_llm_output_or_refuse(reply: str, returned_sources: list[dict]) -> 
 def health():
     return {"status": "ok", "provider": settings.LLM_PROVIDER, "aisecops_mode": settings.AISECOPS_MODE, "tool_gateway_enforce": settings.TOOL_GATEWAY_ENFORCE}
 
+# --- Prometheus /metrics endpoint ---
+@app.get("/metrics")
+def metrics():
+    """
+    Prometheus scrape endpoint.
+    """
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+# --- Security Metrics Endpoint ---
+
+@app.get("/security/metrics")
+def security_metrics(window_seconds: int | None = 86400):
+    """
+    Lightweight telemetry for dashboards.
+    Default window: last 24 hours (86400 seconds). Set window_seconds<=0 to scan all (tail-capped).
+    """
+    if window_seconds is not None and window_seconds <= 0:
+        window_seconds = None
+    return _compute_audit_metrics(window_seconds=window_seconds)
+
+
+# --- Security Events Endpoints ---
+@app.get("/security/events/recent")
+def security_events_recent(
+    limit: int = 200,
+    event: str | None = None,
+    severity: str | None = None,
+    request_id: str | None = None,
+    tenant_id: str | None = None,
+    window_seconds: int | None = 86400,
+):
+    """
+    Investigation endpoint: tail recent audit events (newest-first), optionally filtered.
+    Examples:
+      /security/events/recent?event=retrieval_poisoning_detected
+      /security/events/recent?request_id=<rid>
+      /security/events/recent?tenant_id=default&severity=warn
+    """
+    return _read_recent_audit_events(
+        limit=limit,
+        event=event,
+        severity=severity,
+        request_id=request_id,
+        tenant_id=tenant_id,
+        window_seconds=window_seconds,
+    )
+
+
+
+@app.get("/security/events/by-request/{rid}")
+def security_events_by_request(rid: str, limit: int = 500):
+    """
+    Investigation endpoint: fetch the newest events for a request_id (rid).
+    """
+    rid = (rid or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="rid is required")
+    return _read_recent_audit_events(limit=limit, request_id=rid, window_seconds=None)
+
+
+# --- Security Replay Endpoint ---
+@app.post("/security/replay")
+async def security_replay(req: ReplayRequest):
+    """
+    Investigation + replay endpoint.
+    - Reads the audit chain for the given request_id
+    - Infers tenant_id/top_k from the prior chat_rag_request event (best-effort)
+    - If req.message is provided, re-runs /chat_rag with the inferred/overridden inputs
+    """
+    rid = (req.request_id or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+
+    chain = _read_recent_audit_events(limit=2000, request_id=rid, window_seconds=None)
+    if not chain.get("ok"):
+        return chain
+
+    events = chain.get("events") or []
+
+    inferred_tenant: str | None = None
+    inferred_top_k: int | None = None
+
+    # Best-effort inference from chat_rag_request payload
+    for ev in events:
+        if (ev.get("event") == "chat_rag_request") and isinstance(ev.get("payload"), dict):
+            p = ev["payload"]
+            inferred_tenant = (p.get("tenant_id") or inferred_tenant)
+            try:
+                inferred_top_k = int(p.get("top_k")) if p.get("top_k") is not None else inferred_top_k
+            except Exception:
+                pass
+            break
+
+    # Fallback: any promoted tenant_id in the chain
+    if inferred_tenant is None:
+        for ev in events:
+            t = ev.get("tenant_id")
+            if t:
+                inferred_tenant = str(t)
+                break
+
+    tenant_id = (req.tenant_id or inferred_tenant or "default").strip()
+    top_k = req.top_k if req.top_k is not None else (inferred_top_k or 5)
+
+    # Always record that a replay was requested (but do not store message here).
+    try:
+        audit.event(
+            "security_replay_requested",
+            {"original_request_id": rid, "tenant_id": tenant_id, "top_k": top_k},
+            severity="info",
+        )
+    except Exception:
+        pass
+
+    # If no message is provided, return a replay template + the audit chain.
+    msg = (req.message or "").strip()
+    if not msg:
+        return {
+            "ok": False,
+            "error": "message_required_for_replay",
+            "detail": "Provide 'message' to re-run /chat_rag. (We intentionally do not store raw user messages in audit by default.)",
+            "inferred": {"tenant_id": tenant_id, "top_k": top_k},
+            "replay_curl": {
+                "endpoint": "/chat_rag",
+                "body": {"tenant_id": tenant_id, "message": "<paste original user message>", "top_k": top_k},
+            },
+            "audit_chain": chain,
+        }
+
+    # Execute replay via the same /chat_rag handler
+    replay_req = ChatRAGRequest(tenant_id=tenant_id, message=msg, top_k=top_k)
+    result = await chat_rag(replay_req)
+
+    # Emit a marker that replay executed successfully (store lengths only).
+    try:
+        audit.event(
+            "security_replay_executed",
+            {"original_request_id": rid, "tenant_id": tenant_id, "top_k": top_k, "message_len": len(msg)},
+            severity="info",
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "original_request_id": rid,
+        "replay_inputs": {"tenant_id": tenant_id, "top_k": top_k, "message_len": len(msg)},
+        "replay_result": result,
+        "audit_chain": chain,
+    }
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
     # Minimal: demonstrate policy-driven prompt hygiene hook.
@@ -357,6 +837,10 @@ async def chat(req: ChatRequest):
     try:
         resp = await llm.chat(sanitized)
     except Exception as e:
+        try:
+            LLM_ERRORS_TOTAL.labels(provider=settings.LLM_PROVIDER, where="chat").inc()
+        except Exception:
+            pass
         audit.event("chat_error", {"error": str(e)}, severity="error")
         raise HTTPException(status_code=500, detail="LLM call failed")
 
@@ -403,6 +887,22 @@ async def chat_rag(req: ChatRAGRequest):
         clean, changed = _sanitize_retrieved_text(raw)
         if changed:
             sanitized_count += 1
+            hits = _poison_matches(raw)
+            try:
+                RETRIEVAL_POISONING_TOTAL.labels(tenant_id=tenant_id).inc()
+            except Exception:
+                pass
+            audit.event(
+                "retrieval_poisoning_detected",
+                {
+                    "tenant_id": tenant_id,
+                    "document_id": int(r["document_id"]),
+                    "chunk_id": int(r["id"]),
+                    "hits": hits,
+                    "raw_snippet": (raw or "")[:240],
+                },
+                severity="warn",
+            )
         results.append({"chunk_id": r["id"], "document_id": r["document_id"], "content": clean})
 
     sources_block = _format_sources_for_prompt(results)
@@ -423,11 +923,19 @@ async def chat_rag(req: ChatRAGRequest):
     try:
         resp = await llm.chat(prompt)
     except Exception as e:
+        try:
+            LLM_ERRORS_TOTAL.labels(provider=settings.LLM_PROVIDER, where="chat_rag").inc()
+        except Exception:
+            pass
         audit.event("chat_rag_error", {"error": str(e)}, severity="error")
         raise HTTPException(status_code=500, detail="LLM call failed")
 
     ok, final_text = _validate_llm_output_or_refuse(resp, results)
     if not ok:
+        try:
+            OUTPUT_BLOCK_TOTAL.labels(tenant_id=tenant_id, reason="validation_failed").inc()
+        except Exception:
+            pass
         audit.event("chat_rag_output_blocked", {"reason": "validation_failed", "out_len": len(resp or "")}, severity="block")
         return {"reply": final_text, "provider": settings.LLM_PROVIDER, "tenant_id": tenant_id, "sources": results}
 
@@ -481,6 +989,10 @@ async def rag_ingest(req: RAGIngestRequest):
         raise HTTPException(status_code=500, detail=f"RAG ingest failed: {type(e).__name__}: {e}")
 
     audit.event("rag_ingest", {"tenant_id": tenant_id, "doc_id": int(doc_id), "chunks": len(chunks)})
+    try:
+        RAG_INGEST_TOTAL.labels(tenant_id=tenant_id).inc()
+    except Exception:
+        pass
     return {"ok": True, "tenant_id": tenant_id, "document_id": int(doc_id), "chunks": len(chunks)}
 
 
@@ -523,16 +1035,51 @@ async def rag_query(req: RAGQueryRequest):
         clean, changed = _sanitize_retrieved_text(raw)
         if changed:
             sanitized_count += 1
+            hits = _poison_matches(raw)
+            try:
+                RETRIEVAL_POISONING_TOTAL.labels(tenant_id=tenant_id).inc()
+            except Exception:
+                pass
+            audit.event(
+                "retrieval_poisoning_detected",
+                {
+                    "tenant_id": tenant_id,
+                    "document_id": int(r["document_id"]),
+                    "chunk_id": int(r["id"]),
+                    "hits": hits,
+                    "raw_snippet": (raw or "")[:240],
+                },
+                severity="warn",
+            )
         results.append({"chunk_id": r["id"], "document_id": r["document_id"], "content": clean})
 
     audit.event(
         "rag_query",
         {"tenant_id": tenant_id, "top_k": top_k, "returned": len(results), "sanitized": sanitized_count},
     )
+    try:
+        RAG_QUERY_TOTAL.labels(tenant_id=tenant_id).inc()
+    except Exception:
+        pass
     return {"ok": True, "tenant_id": tenant_id, "results": results}
 
 @app.post("/tools/execute")
 async def execute_tool(req: ToolRequest):
     # Demonstrates tool containment as the AISecOps signature.
     result = await gateway.execute(req)
+    tenant_id = (req.tenant_id or "default")
+    try:
+        TOOL_EXECUTE_TOTAL.labels(tenant_id=tenant_id).inc()
+    except Exception:
+        pass
+
+    # Best-effort block detection without depending on a specific gateway schema.
+    try:
+        if isinstance(result, dict):
+            blocked = bool(result.get("blocked")) or (result.get("ok") is False and "blocked" in (result.get("detail") or "").lower())
+            decision = str(result.get("decision") or "")
+            if blocked or decision.lower() in {"deny", "blocked"}:
+                TOOL_BLOCK_TOTAL.labels(tenant_id=tenant_id).inc()
+    except Exception:
+        pass
     return result
